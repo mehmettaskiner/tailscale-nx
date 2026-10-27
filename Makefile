@@ -19,7 +19,7 @@ endif
 
 all: host-test nro
 
-host-test: drop-test
+host-test: drop-test driver-recovery-test
 	cargo test --workspace
 
 # Taildrop's file saving (native/driver/tsnx_drop.c) on a temporary folder.
@@ -28,6 +28,20 @@ drop-test:
 	$(CC) -Wall -Wextra -O1 -g -fsanitize=address,undefined -Icrates/tsnx-ffi/include -Inative/driver \
 		-o target/drop-test native/host/drop_test.c native/driver/tsnx_drop.c
 	target/drop-test
+
+# Driver socket failures and recovery, with the real engine and ASan/UBSan.
+ifeq ($(shell uname -s),Darwin)
+  DRIVER_TEST_LIBS := -framework CoreFoundation -framework Security
+else
+  DRIVER_TEST_LIBS := -lpthread -ldl -lm
+endif
+.PHONY: driver-recovery-test
+driver-recovery-test:
+	cargo build --locked -p tsnx-ffi
+	$(CC) -Wall -Wextra -O1 -g -fsanitize=address,undefined -Icrates/tsnx-ffi/include -Inative/driver \
+		-o target/driver-recovery-test native/host/driver_recovery_test.c native/driver/tsnx_dns.c \
+		target/debug/libtsnx_ffi.a $(DRIVER_TEST_LIBS)
+	@set -e; for test in persistent flags retry suspend stale port; do target/driver-recovery-test $$test; done
 
 # Local tailnet end-to-end tests (headscale + stock tailscaled in Docker).
 e2e:

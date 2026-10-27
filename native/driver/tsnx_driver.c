@@ -27,6 +27,7 @@ int tsnx_snprintf(char *dst, size_t size, const char *fmt, ...);
 // Datagrams read per readiness report: the rest wait for the next round, so
 // a socket that keeps "returning" something can't hold the loop.
 #define UDP_RECV_BATCH 64
+#define UDP_RETRY_NS 1000000000ull
 
 static const char *volatile g_step;
 #define STEP(s) (g_step = (s))
@@ -50,6 +51,9 @@ struct TsnxDriver {
     char *connect_map;
     int udp_fd;
     uint16_t udp_port;
+    int udp_enabled, udp_suspended;
+    uint64_t udp_retry_at;
+    uint32_t udp_generation, poll_udp_generation;
     // Bookkeeping between prepare and dispatch (slots can be reused mid-dispatch).
     Conn *poll_owners[MAX_CONNS];
     uint32_t poll_ids[MAX_CONNS];
@@ -177,7 +181,22 @@ void tsnx_driver_refresh_endpoints(TsnxDriver *d) {
     tsnx_engine_set_local_endpoints(d->engine, &ep, n, tsnx_driver_now_ns());
 }
 
-int tsnx_driver_open_udp(TsnxDriver *d, uint16_t port) {
+static void udp_log(TsnxDriver *d, const char *reason, int detail) {
+    if (!d->on_event) return;
+    char text[96];
+    snprintf(text, sizeof text, "UDP %s (%d)", reason, detail);
+    TsnxEvent ev = {.kind = TSNX_EVENT_LOG, .text = text};
+    d->on_event(d->ctx, &ev);
+}
+
+static void udp_close(TsnxDriver *d) {
+    if (d->udp_fd >= 0) close(d->udp_fd);
+    d->udp_fd = -1;
+    ++d->udp_generation;
+    tsnx_engine_set_local_endpoints(d->engine, NULL, 0, tsnx_driver_now_ns());
+}
+
+static int udp_open(TsnxDriver *d, uint16_t port) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return -1;
     struct sockaddr_in sin = {0};
@@ -186,28 +205,48 @@ int tsnx_driver_open_udp(TsnxDriver *d, uint16_t port) {
     socklen_t len = sizeof sin;
     if (bind(fd, (struct sockaddr *)&sin, sizeof sin) != 0 || set_nonblocking(fd) != 0 ||
         getsockname(fd, (struct sockaddr *)&sin, &len) != 0) {
+        int err = errno;
         close(fd);
+        errno = err;
         return -1;
     }
     d->udp_fd = fd;
+    ++d->udp_generation;
     d->udp_port = ntohs(sin.sin_port);
+    d->udp_retry_at = 0;
     tsnx_driver_refresh_endpoints(d);
     return 0;
 }
 
+int tsnx_driver_open_udp(TsnxDriver *d, uint16_t port) {
+    d->udp_enabled = 1;
+    d->udp_suspended = 0;
+    d->udp_port = port;
+    if (d->udp_fd >= 0) udp_close(d);
+    int rc = udp_open(d, port);
+    if (rc != 0) d->udp_retry_at = tsnx_driver_now_ns() + UDP_RETRY_NS;
+    return rc;
+}
+
 void tsnx_driver_suspend(TsnxDriver *d) {
+    d->udp_suspended = 1;
+    d->udp_retry_at = 0;
     for (int i = 0; i < MAX_CONNS; i++)
         if (d->conns[i].id) conn_closed(d, &d->conns[i]);
-    if (d->udp_fd >= 0) {
-        close(d->udp_fd);
-        d->udp_fd = -1;
-    }
+    udp_close(d);
 }
 
 int tsnx_driver_resume(TsnxDriver *d) {
-    if (d->udp_fd >= 0 || !d->udp_port) return 0;
+    d->udp_suspended = 0;
+    if (d->udp_fd >= 0 || !d->udp_enabled) return 0;
     // Same port as before, so peers' notion of our endpoint stays valid.
-    return tsnx_driver_open_udp(d, d->udp_port) == 0 ? 0 : tsnx_driver_open_udp(d, 0);
+    if (udp_open(d, d->udp_port) == 0 || (d->udp_port && udp_open(d, 0) == 0)) {
+        udp_log(d, "socket reopened on port", d->udp_port);
+        return 0;
+    }
+    udp_log(d, "reopen failed; retry in 1s, errno", errno);
+    d->udp_retry_at = tsnx_driver_now_ns() + UDP_RETRY_NS;
+    return -1;
 }
 
 static void udp_send(TsnxDriver *d, const TsnxAddr *to, const uint8_t *data, size_t len) {
@@ -411,6 +450,7 @@ void tsnx_driver_pump(TsnxDriver *d) { pump_engine(d); }
 
 int tsnx_driver_prepare(TsnxDriver *d, struct pollfd *fds, int cap, int max_wait_ms, int *wait_ms) {
     uint64_t now = tsnx_driver_now_ns();
+    if (!d->udp_suspended && d->udp_retry_at && now >= d->udp_retry_at) tsnx_driver_resume(d);
     if (now >= tsnx_engine_next_deadline(d->engine)) tsnx_engine_timeout(d->engine, now);
     pump_engine(d);
 
@@ -430,12 +470,14 @@ int tsnx_driver_prepare(TsnxDriver *d, struct pollfd *fds, int cap, int max_wait
     d->poll_udp = -1;
     if (d->udp_fd >= 0 && n < cap) {
         d->poll_udp = n;
+        d->poll_udp_generation = d->udp_generation;
         fds[n].fd = d->udp_fd;
         fds[n].events = POLLIN;
         fds[n++].revents = 0;
     }
 
     uint64_t deadline = tsnx_engine_next_deadline(d->engine);
+    if (d->udp_retry_at && d->udp_retry_at < deadline) deadline = d->udp_retry_at;
     now = tsnx_driver_now_ns();
     int wait = max_wait_ms;
     if (deadline <= now) {
@@ -448,9 +490,19 @@ int tsnx_driver_prepare(TsnxDriver *d, struct pollfd *fds, int cap, int max_wait
 }
 
 void tsnx_driver_dispatch(TsnxDriver *d, const struct pollfd *fds) {
-    if (d->poll_udp >= 0 && (fds[d->poll_udp].revents & POLLIN)) {
-        udp_receive(d);
-        pump_engine(d);
+    if (d->poll_udp >= 0 && fds[d->poll_udp].fd == d->udp_fd &&
+        d->poll_udp_generation == d->udp_generation) {
+        short re = fds[d->poll_udp].revents;
+        if (re & (POLLERR | POLLHUP | POLLNVAL)) {
+            udp_log(d, "poll error; retiring socket, revents", re);
+            // POLLNVAL says it is already invalid; don't close it a second time.
+            if (re & POLLNVAL) d->udp_fd = -1;
+            udp_close(d);
+            d->udp_retry_at = tsnx_driver_now_ns() + UDP_RETRY_NS;
+        } else if (re & POLLIN) {
+            udp_receive(d);
+            pump_engine(d);
+        }
     }
     for (int i = 0; i < d->poll_conns; i++) {
         Conn *c = d->poll_owners[i];

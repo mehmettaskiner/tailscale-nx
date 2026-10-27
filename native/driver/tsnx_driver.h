@@ -20,21 +20,22 @@ TsnxDriver *tsnx_driver_new(TsnxEngine *engine, tsnx_event_fn on_event, void *ct
 void tsnx_driver_free(TsnxDriver *d);
 
 // Opens the engine's UDP socket on `port` (0 = any) for direct peer paths,
-// and advertises the local endpoint. Returns 0, or -1 on failure (the engine
-// then works over DERP only).
+// and advertises the local endpoint. Returns 0, or -1 on failure. Failed
+// opens and poll errors are retried at most once per second while active;
+// the engine can still use DERP in the meantime.
 int tsnx_driver_open_udp(TsnxDriver *d, uint16_t port);
 
 // The last place the driver entered (a static string, NULL before any): if
 // the thread driving it seems stuck, this names where it went last.
 const char *tsnx_driver_step(void);
 
-// Re-detects the local IP and re-advertises endpoints (call after network
-// changes).
+// Re-detects the local IP and re-advertises endpoints without replacing sockets.
 void tsnx_driver_refresh_endpoints(TsnxDriver *d);
 
 // Closes every socket (the engine sees its connections drop and will
-// reconnect), e.g. before the console sleeps. Resume reopens the UDP socket
-// (on the same port if possible); the engine re-dials when next pumped.
+// reconnect), e.g. before sleep or when the local network changes. Cancels
+// pending UDP retries. Resume reopens UDP on the same port if possible, with
+// bounded retries on failure; the engine re-dials when next pumped.
 void tsnx_driver_suspend(TsnxDriver *d);
 int tsnx_driver_resume(TsnxDriver *d);
 

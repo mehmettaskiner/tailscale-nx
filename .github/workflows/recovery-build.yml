@@ -1,0 +1,41 @@
+name: Recovery test build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['fix/network-socket-recovery']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.repository == 'mehmettaskiner/tailscale-nx'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+          persist-credentials: false
+      - name: Build pinned Switch toolchain image
+        run: make docker-image
+      - name: Run host regression tests
+        run: docker run --rm -v "$GITHUB_WORKSPACE:/src" -w /src tsnx-build make host-test
+      - name: Build sysmodule and check memory budget
+        run: make sysmodule
+      - name: Record source and binary checksum
+        run: |
+          git rev-parse HEAD > source-commit.txt
+          sha256sum switch/sysmodule/dist/atmosphere/contents/4200000000005453/exefs.nsp > binary-sha256.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-nx-recovery-test
+          if-no-files-found: error
+          path: |
+            switch/sysmodule/dist/atmosphere/contents/4200000000005453/exefs.nsp
+            switch/sysmodule/tailscale-nx.elf
+            switch/sysmodule/tailscale-nx.map
+            switch/sysmodule/source/heap_size.h
+            source-commit.txt
+            binary-sha256.txt

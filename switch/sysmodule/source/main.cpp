@@ -1175,10 +1175,15 @@ namespace ams {
                 status::SetOffline(cur == 0);
                 if (cur != ip) {
                     Log("local address changed: %s", cur ? inet_ntoa(in_addr{cur}) : "(offline)");
-                    if (cur && !ip) tsnx_engine_network_up(engine, tsnx_driver_now_ns());
                     ip = cur;
                     SetLocalNet(cur);
-                    if (cur) tsnx_driver_refresh_endpoints(d);
+                    // Horizon sockets may retain the old interface after roaming.
+                    // Retire them even for an online-to-online address change.
+                    tsnx_driver_suspend(d);
+                    if (cur) {
+                        tsnx_driver_resume(d);
+                        tsnx_engine_network_up(engine, tsnx_driver_now_ns());
+                    }
                 }
             }
         });
