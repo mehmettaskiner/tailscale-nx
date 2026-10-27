@@ -9,7 +9,29 @@ permissions:
   contents: read
 
 jobs:
+  host-tests:
+    if: github.repository == 'mehmettaskiner/tailscale-nx'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-09-25
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Install host Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Check native sanitizer runtime
+        run: |
+          clang --version
+          printf '#include <stdio.h>\nint main(void) { puts("sanitizer runtime OK"); return 0; }\n' > /tmp/sanitizer-smoke.c
+          clang -fsanitize=address,undefined /tmp/sanitizer-smoke.c -o /tmp/sanitizer-smoke
+          timeout --kill-after=5s 30s /tmp/sanitizer-smoke
+      - name: Run host regression tests with sanitizers
+        run: timeout --kill-after=5s 480s make host-test CC=clang
+
   build:
+    needs: host-tests
     if: github.repository == 'mehmettaskiner/tailscale-nx'
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -20,8 +42,6 @@ jobs:
           persist-credentials: false
       - name: Build pinned Switch toolchain image
         run: make docker-image
-      - name: Run host regression tests
-        run: docker run --rm -v "$GITHUB_WORKSPACE:/src" -w /src tsnx-build make host-test
       - name: Build sysmodule and check memory budget
         run: make sysmodule
       - name: Record source and binary checksum
