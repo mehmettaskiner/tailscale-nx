@@ -154,6 +154,20 @@ static void port_fallback(void) {
     close(occupied);
     destroy(d);
 }
+static void tcp_invalid(void) {
+    TsnxDriver *d = driver();
+    struct pollfd fds[TSNX_DRIVER_MAX_FDS];
+    prepare(d, fds);
+    assert(d->poll_conns > 0); // Real control connection created by the engine.
+    Conn *c = d->poll_owners[0];
+    uint32_t id = c->id;
+    close(c->fd);
+    assert(poll(fds, d->poll_conns, 0) > 0);
+    assert(fds[0].revents & POLLNVAL);
+    tsnx_driver_dispatch(d, fds);
+    assert(c->id != id); // Invalid connection must leave the poll set.
+    destroy(d);
+}
 int main(int argc, char **argv) {
     assert(argc == 2);
     if (!strcmp(argv[1], "persistent")) persistent_error();
@@ -162,6 +176,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "suspend")) suspended_retry();
     else if (!strcmp(argv[1], "stale")) stale_poll();
     else if (!strcmp(argv[1], "port")) port_fallback();
+    else if (!strcmp(argv[1], "tcp-invalid")) tcp_invalid();
     else abort();
     printf("PASS: %s\n", argv[1]);
 }

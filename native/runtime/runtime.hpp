@@ -83,6 +83,10 @@ public:
         on_suspend_ = std::move(on_suspend);
         on_resume_ = std::move(on_resume);
     }
+    // Configure before Run(). Called with the engine lock held; do not re-enter.
+    void SetDiagnosticHook(std::function<void(const char *, int)> diagnostic) {
+        diagnostic_ = std::move(diagnostic);
+    }
     ~Runtime();
     Runtime(const Runtime &) = delete;
     Runtime &operator=(const Runtime &) = delete;
@@ -117,7 +121,10 @@ private:
     Runtime() = default;
     void Loop(const std::function<void(TsnxDriver *)> *on_tick);
     void AfterCall();
-    void Wake();
+    void Wake();  // lock held (the pair belongs to the engine loop)
+    void RetireWake(const char *reason, int detail, bool invalid_rx = false);
+    void RetryWake();
+    void Diagnostic(const char *reason, int detail);
 
     struct InternalScope {
         InternalScope() { internal_depth_++; }
@@ -143,6 +150,9 @@ private:
     std::function<void()> on_suspend_, on_resume_;
     bool suspended_ = false;
     int wake_rx_ = -1, wake_tx_ = -1;
+    int wake_send_error_ = 0;
+    Clock::time_point wake_retry_at_{};
+    std::function<void(const char *, int)> diagnostic_;
     std::unique_ptr<TsnxDropDir> drop_;  // Taildrop folder state (Start())
 };
 

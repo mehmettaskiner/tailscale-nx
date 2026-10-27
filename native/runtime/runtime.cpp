@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <ctime>
 #include <vector>
@@ -34,6 +35,11 @@ std::vector<uint8_t> ReadFile(const std::string &path) {
 }
 #endif
 
+bool Nonblocking(int fd) {
+    const int flags = fcntl(fd, F_GETFL, 0);
+    return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+}
+
 // A loopback UDP pair used to interrupt the engine thread's poll().
 bool MakeWakePair(int *rx, int *tx) {
     *rx = socket(AF_INET, SOCK_DGRAM, 0);
@@ -44,14 +50,15 @@ bool MakeWakePair(int *rx, int *tx) {
     socklen_t len = sizeof a;
     if (*rx < 0 || *tx < 0 || bind(*rx, reinterpret_cast<sockaddr *>(&a), sizeof a) != 0 ||
         getsockname(*rx, reinterpret_cast<sockaddr *>(&a), &len) != 0 ||
-        connect(*tx, reinterpret_cast<sockaddr *>(&a), sizeof a) != 0) {
+        connect(*tx, reinterpret_cast<sockaddr *>(&a), sizeof a) != 0 ||
+        !Nonblocking(*rx) || !Nonblocking(*tx)) {
+        const int error = errno;
         if (*rx >= 0) close(*rx);
         if (*tx >= 0) close(*tx);
         *rx = *tx = -1;
+        errno = error;
         return false;
     }
-    fcntl(*rx, F_SETFL, fcntl(*rx, F_GETFL, 0) | O_NONBLOCK);
-    fcntl(*tx, F_SETFL, fcntl(*tx, F_GETFL, 0) | O_NONBLOCK);
     return true;
 }
 
@@ -150,8 +157,8 @@ void Runtime::Stop() {
     {
         std::lock_guard<std::mutex> lock(mu_);
         stop_ = true;
+        Wake();
     }
-    Wake();
     cv_.notify_all();
 }
 
@@ -169,7 +176,34 @@ Runtime::~Runtime() {
 void Runtime::Wake() {
     if (wake_tx_ < 0) return;
     char b = 0;
-    send(wake_tx_, &b, 1, 0);
+    if (send(wake_tx_, &b, 1, 0) < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        // Another thread may be polling this pair. Defer closing it until the
+        // engine has consumed that poll result, so recycled fd numbers are safe.
+        wake_send_error_ = errno;
+    }
+}
+
+void Runtime::Diagnostic(const char *reason, int detail) {
+    if (diagnostic_) diagnostic_(reason, detail);
+}
+
+void Runtime::RetireWake(const char *reason, int detail, bool invalid_rx) {
+    Diagnostic(reason, detail);
+    if (wake_rx_ >= 0 && !invalid_rx) close(wake_rx_);
+    if (wake_tx_ >= 0) close(wake_tx_);
+    wake_rx_ = wake_tx_ = -1;
+    wake_send_error_ = 0;
+    wake_retry_at_ = Clock::now() + std::chrono::seconds(1);
+}
+
+void Runtime::RetryWake() {
+    if (wake_rx_ >= 0 || Clock::now() < wake_retry_at_) return;
+    if (MakeWakePair(&wake_rx_, &wake_tx_)) {
+        Diagnostic("wake sockets reopened", 0);
+    } else {
+        Diagnostic("wake socket reopen failed, errno", errno);
+    }
+    wake_retry_at_ = Clock::now() + std::chrono::seconds(1);
 }
 
 void Runtime::AfterCall() {
@@ -226,6 +260,7 @@ bool Runtime::WaitFor(const std::function<bool(TsnxEngine *)> &ready, const Cloc
 void Runtime::Loop(const std::function<void(TsnxDriver *)> *on_tick) {
     InternalScope internal;  // this thread only ever does engine work
     pollfd fds[TSNX_DRIVER_MAX_FDS + 1];
+    Clock::time_point poll_log_at{};
     std::unique_lock<std::mutex> lock(mu_);
     while (!stop_) {
         suspend_reasons_ |= async_suspend_.exchange(0);
@@ -235,6 +270,7 @@ void Runtime::Loop(const std::function<void(TsnxDriver *)> *on_tick) {
             close(wake_rx_);
             close(wake_tx_);
             wake_rx_ = wake_tx_ = -1;
+            wake_send_error_ = 0;
             if (on_suspend_) on_suspend_();
             suspended_ = true;
             suspended_flag_ = true;
@@ -250,13 +286,15 @@ void Runtime::Loop(const std::function<void(TsnxDriver *)> *on_tick) {
             // Without a wake pair the loop still runs, just with up to a
             // second of latency for new overlay sockets.
             if (on_resume_) on_resume_();
-            MakeWakePair(&wake_rx_, &wake_tx_);
+            wake_retry_at_ = Clock::time_point{};
+            RetryWake();
             tsnx_driver_resume(driver_);
             suspended_ = false;
             suspended_flag_ = false;
             cv_.notify_all();
             continue;
         }
+        RetryWake();
         if (on_tick && *on_tick) (*on_tick)(driver_);
         int wait = 0;
         int n = tsnx_driver_prepare(driver_, fds, TSNX_DRIVER_MAX_FDS, 1000, &wait);
@@ -266,12 +304,42 @@ void Runtime::Loop(const std::function<void(TsnxDriver *)> *on_tick) {
         const int nfds = n + (wake_rx_ >= 0 ? 1 : 0);
         lock.unlock();
         int rc = poll(fds, static_cast<nfds_t>(nfds), wait);
+        const int poll_error = errno;
         lock.lock();
-        if (wake_rx_ >= 0 && (fds[n].revents & POLLIN)) {
-            char buf[64];
-            while (recv(wake_rx_, buf, sizeof buf, 0) > 0) {
+        if (rc < 0) {
+            // No poll is outstanding now, even on error. Retire a pending
+            // sender failure and publish readiness advanced by prepare().
+            if (wake_send_error_) RetireWake("wake send error; retiring sockets, errno", wake_send_error_);
+            cv_.notify_all();
+            if (poll_error != EINTR) {
+                const auto now = Clock::now();
+                if (now >= poll_log_at) {
+                    Diagnostic("poll failed; backing off, errno", poll_error);
+                    poll_log_at = now + std::chrono::seconds(1);
+                }
+                // A persistent socket-service error must not monopolize a CPU
+                // or the engine mutex. Stop() can interrupt this bounded wait.
+                cv_.wait_for(lock, std::chrono::milliseconds(100), [&] { return stop_; });
+            }
+            continue;
+        }
+        if (wake_rx_ >= 0 && rc > 0) {
+            const short re = fds[n].revents;
+            if (re & (POLLERR | POLLHUP | POLLNVAL)) {
+                RetireWake("wake poll error; retiring sockets, revents", re, re & POLLNVAL);
+            } else if (re & POLLIN) {
+                char buf[64];
+                // Bound draining, even if a backend keeps reporting data.
+                for (int i = 0; i < 64; ++i) {
+                    if (recv(wake_rx_, buf, sizeof buf, 0) >= 0) continue;
+                    if (errno == EINTR) continue;
+                    if (errno != EAGAIN && errno != EWOULDBLOCK)
+                        RetireWake("wake receive error; retiring sockets, errno", errno);
+                    break;
+                }
             }
         }
+        if (wake_send_error_) RetireWake("wake send error; retiring sockets, errno", wake_send_error_);
         if (rc > 0) tsnx_driver_dispatch(driver_, fds);
         // Socket readiness may have changed; let waiters re-check.
         cv_.notify_all();

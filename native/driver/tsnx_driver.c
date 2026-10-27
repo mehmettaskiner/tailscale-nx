@@ -181,10 +181,10 @@ void tsnx_driver_refresh_endpoints(TsnxDriver *d) {
     tsnx_engine_set_local_endpoints(d->engine, &ep, n, tsnx_driver_now_ns());
 }
 
-static void udp_log(TsnxDriver *d, const char *reason, int detail) {
+static void driver_log(TsnxDriver *d, const char *reason, int detail) {
     if (!d->on_event) return;
     char text[96];
-    snprintf(text, sizeof text, "UDP %s (%d)", reason, detail);
+    snprintf(text, sizeof text, "%s (%d)", reason, detail);
     TsnxEvent ev = {.kind = TSNX_EVENT_LOG, .text = text};
     d->on_event(d->ctx, &ev);
 }
@@ -241,10 +241,10 @@ int tsnx_driver_resume(TsnxDriver *d) {
     if (d->udp_fd >= 0 || !d->udp_enabled) return 0;
     // Same port as before, so peers' notion of our endpoint stays valid.
     if (udp_open(d, d->udp_port) == 0 || (d->udp_port && udp_open(d, 0) == 0)) {
-        udp_log(d, "socket reopened on port", d->udp_port);
+        driver_log(d, "UDP socket reopened on port", d->udp_port);
         return 0;
     }
-    udp_log(d, "reopen failed; retry in 1s, errno", errno);
+    driver_log(d, "UDP reopen failed; retry in 1s, errno", errno);
     d->udp_retry_at = tsnx_driver_now_ns() + UDP_RETRY_NS;
     return -1;
 }
@@ -494,7 +494,7 @@ void tsnx_driver_dispatch(TsnxDriver *d, const struct pollfd *fds) {
         d->poll_udp_generation == d->udp_generation) {
         short re = fds[d->poll_udp].revents;
         if (re & (POLLERR | POLLHUP | POLLNVAL)) {
-            udp_log(d, "poll error; retiring socket, revents", re);
+            driver_log(d, "UDP poll error; retiring socket, revents", re);
             // POLLNVAL says it is already invalid; don't close it a second time.
             if (re & POLLNVAL) d->udp_fd = -1;
             udp_close(d);
@@ -509,6 +509,12 @@ void tsnx_driver_dispatch(TsnxDriver *d, const struct pollfd *fds) {
         uint32_t id = d->poll_ids[i];
         short re = fds[i].revents;
         if (!re || c->id != id) continue;
+        if (re & POLLNVAL) {
+            driver_log(d, "TCP invalid descriptor; retiring connection", c->fd);
+            c->fd = -1; // Already invalid; do not close a recycled descriptor.
+            conn_closed(d, c);
+            continue;
+        }
         if (c->connecting && (re & (POLLOUT | POLLERR | POLLHUP))) {
             int err = 0;
             socklen_t len = sizeof err;

@@ -1088,6 +1088,7 @@ namespace ams {
             Log("runtime: %s (errno %d)", error.c_str(), errno);
             return;
         }
+        rt->SetDiagnosticHook([](const char *reason, int detail) { Log("runtime: %s (%d)", reason, detail); });
         Log("engine started: control %s, hostname %s", cfg.control_url, cfg.hostname);
         // Before the loop and the MITM threads use the engine.
         if (std::strcmp(cfg.taildrop, "off") != 0) taildrop::Start(driver);

@@ -19,7 +19,7 @@ endif
 
 all: host-test nro
 
-host-test: drop-test driver-recovery-test
+host-test: drop-test driver-recovery-test runtime-recovery-test
 	cargo test --workspace
 
 # Taildrop's file saving (native/driver/tsnx_drop.c) on a temporary folder.
@@ -41,7 +41,19 @@ driver-recovery-test:
 	$(CC) -Wall -Wextra -O1 -g -fsanitize=address,undefined -Icrates/tsnx-ffi/include -Inative/driver \
 		-o target/driver-recovery-test native/host/driver_recovery_test.c native/driver/tsnx_dns.c \
 		target/debug/libtsnx_ffi.a $(DRIVER_TEST_LIBS)
-	@set -e; for test in persistent flags retry suspend stale port; do target/driver-recovery-test $$test; done
+	@set -e; for test in persistent flags retry suspend stale port tcp-invalid; do target/driver-recovery-test $$test; done
+
+# Runtime wake sockets: real poll faults, real engine, no interposition library.
+.PHONY: runtime-recovery-test
+runtime-recovery-test:
+	cargo build --locked -p tsnx-ffi
+	$(CC) -O1 -g -fsanitize=address,undefined -Icrates/tsnx-ffi/include -Inative/driver -c native/driver/tsnx_driver.c -o target/runtime-driver.o
+	$(CC) -O1 -g -fsanitize=address,undefined -Icrates/tsnx-ffi/include -Inative/driver -c native/driver/tsnx_dns.c -o target/runtime-dns.o
+	$(CXX) -std=c++17 -Wall -Wextra -O1 -g -fsanitize=address,undefined -DTSNX_NO_STDIO \
+		-Icrates/tsnx-ffi/include -Inative/driver -Inative/runtime -Inative/vsock \
+		-o target/runtime-recovery-test native/host/runtime_recovery_test.cpp target/runtime-driver.o target/runtime-dns.o \
+		target/debug/libtsnx_ffi.a $(DRIVER_TEST_LIBS)
+	@set -e; for test in normal hup error invalid receive send retry suspend nonblocking stop stop-suspended poll; do target/runtime-recovery-test $$test; done
 
 # Local tailnet end-to-end tests (headscale + stock tailscaled in Docker).
 e2e:
